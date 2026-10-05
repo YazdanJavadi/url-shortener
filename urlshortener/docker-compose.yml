@@ -1,0 +1,92 @@
+# docker-compose.yml — orchestrates postgres, redis, and the urlshort app.
+#
+# Bring everything up:        docker compose up -d --build
+# Run migrations only:         docker compose run --rm app migrate
+# Tail logs:                   docker compose logs -f app
+# Shell into a container:      docker compose exec app sh
+# Tear down (keep data):       docker compose down
+# Tear down (wipe volumes):    docker compose down -v
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: urlshort-postgres
+    environment:
+      POSTGRES_USER: urlshort
+      POSTGRES_PASSWORD: urlshort
+      POSTGRES_DB: urlshort
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U urlshort"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: urlshort-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # Jaeger all-in-one: collects OTLP traces (HTTP :4318, gRPC :4317) and
+  # serves the UI + query API on :16686.
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: urlshort-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true" # enable OTLP ingestion (on by default)
+    ports:
+      - "16686:16686" # Jaeger UI
+      - "4318:4318"   # OTLP HTTP
+      - "4317:4317"   # OTLP gRPC
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: urlshort:latest
+    container_name: urlshort-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Viper env overrides (URLSHORT_<SECTION>_<KEY>) point at the compose
+      # service hostnames instead of localhost.
+      URLSHORT_DB_HOST: postgres
+      URLSHORT_DB_PORT: "5432"
+      URLSHORT_DB_USER: urlshort
+      URLSHORT_DB_PASSWORD: urlshort
+      URLSHORT_DB_NAME: urlshort
+      URLSHORT_DB_SSL_MODE: disable
+      URLSHORT_CACHE_ENABLED: "true"
+      URLSHORT_CACHE_ADDRESS: redis:6379
+      URLSHORT_CACHE_TTL_SECONDS: "3600"
+      URLSHORT_TRACING_ENABLED: "true"
+      URLSHORT_TRACING_SERVICE_NAME: urlshort
+      URLSHORT_TRACING_OTLP_ENDPOINT: jaeger:4318
+      URLSHORT_TRACING_INSECURE: "true"
+      URLSHORT_SERVER_PORT: "8080"
+      URLSHORT_SERVER_BASE_URL: "http://localhost:8080"
+      URLSHORT_LOG_LEVEL: info
+      URLSHORT_LOG_FORMAT: json
+    ports:
+      - "8080:8080"
+    # Migrate on every start, then serve. Idempotent so safe to repeat.
+    command: ["sh", "-c", "/app/urlshort migrate && /app/urlshort serve"]
+    restart: unless-stopped
+
+volumes:
+  pgdata:
